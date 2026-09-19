@@ -134,19 +134,198 @@ enum WhatsAppModule {
             return result
         }
     }
+    private static let searchFieldIdentifier = "TokenizedSearchBar_TextView"
+    private static let chatResultIdentifier  = "ChatListSearchView_ChatResult"
+    private static let headerIdentifier      = "NavigationBar_HeaderViewButton"
+    private static let composerIdentifier    = "ChatBar_ComposerTextView"
+
+    /// Finds one element of the WhatsApp UI by its accessibility identifier.
+    private static func element(_ identifier: String, pid: pid_t) -> [String: Any]? {
+        let result = AccessibilityModule.find(args: [
+            "pid": Int(pid), "query": identifier, "maxNodes": 1500, "maxDepth": 20
+        ])
+        guard let rows = result["elements"] as? [[String: Any]] else { return nil }
+        return rows.first { ($0["identifier"] as? String) == identifier }
+    }
+
+    /// Types `query` into WhatsApp's search bar and leaves the results on
+    /// screen.
+    ///
+    /// The search bar cannot be driven the way this used to try. It is an
+    /// AXStaticText whose value is NOT settable -- even after clicking it,
+    /// it stays AXStaticText/settable=false -- so the old implementation's
+    /// two guards could never both pass: it required the element to be an
+    /// AXTextField/AXSearchField/AXTextArea and then called setText, which
+    /// requires a writable value. Against the real WhatsApp UI this route
+    /// rejected WhatsApp's own search bar every single time with "Select
+    /// the search field from /whatsapp/read", leaving callers to conclude
+    /// the app had no search field and improvise (Cmd+N and hand-typing was
+    /// the observed fallback, which then burned an entire tool budget).
+    ///
+    /// Real keyboard events work fine -- same underlying reason drafting
+    /// had to change; see typeIntoComposer. `searchElementId` is now
+    /// optional: the bar is found by its stable identifier, so callers
+    /// don't have to take a snapshot purely to obtain an id.
     static func search(args: [String: Any]) -> [String: Any] {
         PowerSupport.result {
             try PowerSupport.trusted()
-            let app = try running(), query = try PowerSupport.text(args, "query", max: 1000)
-            let id = try PowerSupport.text(args, "searchElementId")
-            let field = try AccessibilityModule.entry(id)
-            guard field.pid == app.processIdentifier else { throw PowerError.message("Search element belongs to another app") }
-            guard ["AXTextField", "AXSearchField", "AXTextArea"].contains(AccessibilityModule.string(field.element, kAXRoleAttribute) ?? "") else {
-                throw PowerError.message("Select the search field from /whatsapp/read")
-            }
+            let app = try running()
+            let query = try PowerSupport.text(args, "query", max: 1000)
             try PowerSupport.activate(app)
-            try AccessibilityModule.setText(field, text: query)
-            return ["ok": true, "query": query, "note": "Search text verified. Refresh /whatsapp/read, inspect matching chats, and open the correct result using its AX action"]
+            let results = try runSearch(query: query, app: app)
+            return [
+                "ok": true,
+                "query": query,
+                "results": results,
+                "note": "Search results are on screen. Open one with /whatsapp/open-chat-by-name, "
+                      + "or press a result's elementId via /ui/action. Element IDs expire in 120s."
+            ]
+        }
+    }
+
+    /// Focuses the search bar, replaces its contents with `query`, and
+    /// returns the matching chat rows. Shared by search() and
+    /// openChatByName().
+    @discardableResult
+    private static func runSearch(query: String, app: NSRunningApplication) throws -> [[String: Any]] {
+        guard let field = element(searchFieldIdentifier, pid: app.processIdentifier),
+              let fieldId = field["elementId"] as? String else {
+            throw PowerError.message(
+                "Could not find WhatsApp's search bar (\(searchFieldIdentifier)). Make sure the "
+                + "main chat window is open rather than a settings or media view."
+            )
+        }
+
+        // Clicking the bar is what puts keyboard focus in it; it never
+        // becomes a settable text element, so typing is the only way in.
+        let entry = try AccessibilityModule.entry(fieldId)
+        try AccessibilityModule.check(
+            AXUIElementPerformAction(entry.element, kAXPressAction as CFString), "Focus the search bar"
+        )
+        usleep(400_000)
+
+        _ = Keyboard.pressKey(args: ["key": "a", "modifiers": ["cmd"]])
+        usleep(60_000)
+        _ = Keyboard.pressKey(args: ["key": "delete"])
+        usleep(60_000)
+
+        let typed = Keyboard.typeText(args: ["text": query])
+        guard typed["ok"] as? Bool == true else {
+            throw PowerError.message(
+                "Could not type into the search bar: \(typed["error"] as? String ?? "unknown error")"
+            )
+        }
+        usleep(900_000)   // let WhatsApp filter and redraw
+
+        let snapshot = AccessibilityModule.snapshot(args: [
+            "pid": Int(app.processIdentifier), "maxNodes": 1500, "maxDepth": 20
+        ])
+        let rows = (snapshot["elements"] as? [[String: Any]]) ?? []
+        return rows.filter { ($0["identifier"] as? String) == chatResultIdentifier }
+    }
+
+    /// One call to go from a person's name to an open chat with its
+    /// composer ready.
+    ///
+    /// Exists because the documented path -- read, find the search field,
+    /// search, re-read, find the right row, press it, re-read, draft,
+    /// re-read, send -- is nine round trips before a message exists, each
+    /// returning a large accessibility snapshot, against an agent budget of
+    /// fifteen tool calls. Agents ran out partway and reported being stuck.
+    /// This collapses the first six into one.
+    ///
+    /// It deliberately does NOT resolve ambiguity itself: several chats can
+    /// match a first name, and picking one would be exactly the guess the
+    /// rest of this module refuses to make. Zero or multiple matches return
+    /// the candidates and open nothing.
+    static func openChatByName(args: [String: Any]) -> [String: Any] {
+        PowerSupport.result {
+            try PowerSupport.trusted()
+            let app = try running()
+            let name = try PowerSupport.text(args, "name", max: 200)
+            try PowerSupport.activate(app)
+
+            let rows = try runSearch(query: name, app: app)
+            let described: [(row: [String: Any], label: String)] = rows.compactMap {
+                guard let d = ($0["description"] as? String) ?? ($0["title"] as? String) else { return nil }
+                return ($0, normalizedLabel(d))
+            }
+            let wanted = normalizedLabel(name)
+            var matches = described.filter { $0.label.caseInsensitiveCompare(wanted) == .orderedSame }
+            if matches.isEmpty {
+                matches = described.filter { $0.label.range(of: wanted, options: .caseInsensitive) != nil }
+            }
+
+            let candidates = described.map { $0.label }
+            guard matches.count == 1, let target = matches.first else {
+                return [
+                    "ok": false,
+                    "opened": false,
+                    "ambiguous": matches.count > 1,
+                    "candidates": candidates,
+                    "error": matches.isEmpty
+                        ? "No chat matches \(name.debugDescription). Candidates currently on "
+                          + "screen: \(candidates). Try the exact chat name."
+                        : "\(matches.count) chats match \(name.debugDescription): "
+                          + "\(matches.map { $0.label }). Nothing was opened -- ask which one, "
+                          + "then call again with that exact name."
+                ]
+            }
+
+            guard let rowId = target.row["elementId"] as? String else {
+                throw PowerError.message("Matched chat row has no usable element id")
+            }
+            let rowEntry = try AccessibilityModule.entry(rowId)
+            try AccessibilityModule.check(
+                AXUIElementPerformAction(rowEntry.element, kAXPressAction as CFString),
+                "Open the chat"
+            )
+            // WhatsApp gives the composer keyboard focus by itself when a
+            // chat is opened from a search result, so nothing further is
+            // needed here -- openChatByName returns with the composer ready
+            // to type into, which is what composerFocused reports below.
+            //
+            // Do NOT press Escape to "tidy up" the search first: it doesn't
+            // just close the search, it backs out of the chat entirely,
+            // leaving no header and no composer at all. Tried, measured,
+            // removed.
+            usleep(1_200_000)
+
+            // Confirm the chat that actually opened is the one intended --
+            // pressing a row is not proof of what the app then displayed.
+            guard let header = element(headerIdentifier, pid: app.processIdentifier),
+                  let headerLabel = (header["description"] as? String) ?? (header["title"] as? String) else {
+                throw PowerError.message(
+                    "Opened a chat but could not read its header to confirm the recipient. "
+                    + "Inspect /whatsapp/read before drafting anything."
+                )
+            }
+            guard normalizedLabel(headerLabel).caseInsensitiveCompare(target.label) == .orderedSame else {
+                throw PowerError.message(
+                    "Opened a chat whose header reads \(headerLabel.debugDescription), but "
+                    + "\(target.label.debugDescription) was selected. Nothing was drafted."
+                )
+            }
+
+            let composer = element(composerIdentifier, pid: app.processIdentifier)
+            // Deliberately not reporting a "composerFocused" flag. The
+            // focused attribute read from a snapshot lags the real focus
+            // state, so it came back false on chats that then drafted
+            // perfectly -- a misleading signal that would push a caller
+            // into unnecessary recovery steps. draft() establishes focus
+            // itself and refuses to type if it can't, which is the check
+            // that actually matters.
+            return [
+                "ok": true,
+                "opened": true,
+                "recipient": normalizedLabel(headerLabel),
+                "headerElementId": header["elementId"] as Any,
+                "editorElementId": composer?["elementId"] as Any? ?? NSNull(),
+                "composerReady": composer != nil,
+                "sent": false,
+                "note": "Chat is open and the header was verified. These element IDs are fresh -- "
+                      + "pass them straight to /whatsapp/draft. Drafting does not send."
+            ]
         }
     }
     /// The caller must choose the conversation header, not a matching sidebar row.
@@ -222,18 +401,45 @@ enum WhatsAppModule {
         app: NSRunningApplication,
         text: String
     ) throws {
-        // Focus the composer, then confirm the app agrees it is focused.
-        try AccessibilityModule.check(
-            AXUIElementSetAttributeValue(editor.element, kAXFocusedAttribute as CFString, kCFBooleanTrue),
-            "Focus the message composer"
-        )
-
+        // Focus the composer, then confirm the app AGREES it is focused.
+        //
+        // Two escalating attempts, because one isn't always enough:
+        // setting AXFocused can succeed as an API call while focus actually
+        // stays put, and AXPress on the composer is what shifts it in that
+        // case. Usually neither is needed -- opening a chat focuses the
+        // composer already -- but draft() can also be called against a chat
+        // that was opened some other way.
         let root = AXUIElementCreateApplication(app.processIdentifier)
-        guard let focused = AccessibilityModule.elementAttribute(root, kAXFocusedUIElementAttribute),
-              CFEqual(focused, editor.element) else {
+        func composerHasFocus() -> Bool {
+            guard let focused = AccessibilityModule.elementAttribute(root, kAXFocusedUIElementAttribute)
+            else { return false }
+            return CFEqual(focused, editor.element)
+        }
+
+        if !composerHasFocus() {
+            _ = AXUIElementSetAttributeValue(editor.element, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+            usleep(250_000)
+        }
+        if !composerHasFocus(), AccessibilityModule.actions(editor.element).contains(kAXPressAction) {
+            _ = AXUIElementPerformAction(editor.element, kAXPressAction as CFString)
+            usleep(300_000)
+        }
+        // Deliberately no Escape fallback here. It looks like a harmless
+        // way to dismiss whatever overlay is holding focus, but in WhatsApp
+        // it closes the open chat as well -- header and composer both
+        // disappear -- which turns a focus problem into a lost conversation
+        // mid-draft. Better to fail with an explanation than to "recover"
+        // into a different screen.
+
+        // Still not focused: refuse. Synthetic keystrokes go wherever focus
+        // actually is, and what follows is Select All + Delete + the
+        // message -- doing that blind could wipe and overwrite an unrelated
+        // field, or type a private message into the wrong window.
+        guard composerHasFocus() else {
             throw PowerError.message(
-                "The message composer did not take keyboard focus, so nothing was typed. "
-                + "Something else may have taken focus; re-read WhatsApp and try again."
+                "The message composer would not take keyboard focus, so nothing was typed "
+                + "(no keystrokes were sent anywhere). Open the chat with "
+                + "/whatsapp/open-chat-by-name, which leaves the composer focused, then retry."
             )
         }
 

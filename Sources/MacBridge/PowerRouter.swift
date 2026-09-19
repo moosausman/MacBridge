@@ -21,6 +21,7 @@ enum PowerRouter {
         case "/whatsapp/open-chat": return WhatsAppModule.open(args: args, chat: true)
         case "/whatsapp/read": return WhatsAppModule.read(args: args)
         case "/whatsapp/search": return WhatsAppModule.search(args: args)
+        case "/whatsapp/open-chat-by-name": return WhatsAppModule.openChatByName(args: args)
         case "/whatsapp/draft": return WhatsAppModule.draft(args: args)
         case "/whatsapp/send": return WhatsAppModule.send(args: args)
         default: return nil
