@@ -182,6 +182,11 @@ enum Router {
         case "/safari/current-tab":
             return Safari.currentTab(args: args)
 
+        // Spotify
+        case "/spotify/state": return SpotifyModule.state(args: args)
+        case "/spotify/play-uri": return SpotifyModule.playURI(args: args)
+        case "/spotify/control": return SpotifyModule.control(args: args)
+
         // Shortcuts (arbitrary shortcut execution — see file header for
         // the localhost-only caveat)
         case "/shortcuts/run":
