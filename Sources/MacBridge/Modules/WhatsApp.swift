@@ -26,6 +26,40 @@ enum WhatsAppModule {
         }
         return app
     }
+    /// Strips Unicode bidirectional control characters and trims.
+    ///
+    /// WhatsApp prefixes nearly every accessibility label it publishes with
+    /// U+200E LEFT-TO-RIGHT MARK: the Send button's AXDescription is
+    /// literally "\u{200E}Send", not "Send". Both draft() and send()
+    /// compared labels with exact string equality, so the default
+    /// expectedSendLabel of "Send" could never match the real button --
+    /// send() rejected the genuine Send control with "Send button label
+    /// changed; inspect it and pass its exact expectedSendLabel" 100% of
+    /// the time, which is unfixable from the caller's side because the
+    /// invisible character doesn't survive being read, copied and passed
+    /// back as an argument.
+    ///
+    /// Only invisible formatting characters are removed. Everything that
+    /// renders -- letters, digits, punctuation, emoji -- is preserved, so
+    /// this loosens the comparison without weakening the identity check
+    /// that the confirmation gate depends on.
+    private static func normalizedLabel(_ s: String) -> String {
+        let bidiControls: Set<Character> = [
+            "\u{200E}", "\u{200F}",                         // LRM, RLM
+            "\u{202A}", "\u{202B}", "\u{202C}", "\u{202D}", "\u{202E}",  // embedding/override
+            "\u{2066}", "\u{2067}", "\u{2068}", "\u{2069}"  // isolates
+        ]
+        return String(s.filter { !bidiControls.contains($0) })
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// True when `candidates` holds `expected`, ignoring bidi marks and
+    /// surrounding whitespace.
+    private static func labelMatches(_ candidates: [String], _ expected: String) -> Bool {
+        let want = normalizedLabel(expected)
+        return candidates.contains { normalizedLabel($0) == want }
+    }
+
     static func status(args: [String: Any]) -> [String: Any] {
         let app = try? running()
         return ["ok": true, "installed": installedURL() != nil, "running": app != nil,
@@ -132,7 +166,17 @@ enum WhatsAppModule {
         let labels = [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute].compactMap {
             AccessibilityModule.string(header.element, $0)
         }
-        guard labels.contains(recipient) else { throw PowerError.message("Conversation header no longer matches expectedRecipient") }
+        // Normalized for the same reason as the Send button label: contact
+        // names generally come through clean, but group names and any
+        // WhatsApp-supplied header text can carry bidi marks, and an
+        // invisible character must not be the thing that blocks a send the
+        // user actually asked for.
+        guard labelMatches(labels, recipient) else {
+            throw PowerError.message(
+                "Conversation header is \(labels.map { $0.debugDescription }.joined(separator: ", ")), "
+                + "which does not match expectedRecipient \(recipient.debugDescription)"
+            )
+        }
         guard ["AXTextArea", "AXTextField"].contains(AccessibilityModule.string(editor.element, kAXRoleAttribute) ?? "") else {
             throw PowerError.message("editorElementId must identify the message composer")
         }
@@ -146,14 +190,117 @@ enum WhatsAppModule {
         }
         return (app, header, editor)
     }
+    /// Types `text` into the composer using real keyboard events.
+    ///
+    /// WHY NOT setValue
+    /// ---------------
+    /// This used to be `AccessibilityModule.setText(editor, text:)`, i.e.
+    /// AXUIElementSetAttributeValue on the composer's value. That writes
+    /// the string into the text view and reads back correctly -- the old
+    /// code's "draftVerified": true was honest as far as it went -- but it
+    /// never travels through WhatsApp's text input pipeline, so the app's
+    /// own view model still believes the composer is empty.
+    ///
+    /// The visible consequence: WhatsApp swaps ChatBar_VoiceMessageButton
+    /// for ChatBar_SendButton only when it thinks there is text. After a
+    /// setValue draft the Voice Message button is still there, no Send
+    /// button exists anywhere in the accessibility tree, and pressing
+    /// Return does nothing either -- for the same reason. An agent then
+    /// burns its whole tool budget hunting for a control that was never
+    /// created. (Confirmed empirically: setValue -> no ChatBar_SendButton;
+    /// identical text typed as CGEvents -> ChatBar_SendButton appears.)
+    ///
+    /// SAFETY
+    /// ------
+    /// Synthetic keystrokes go wherever focus happens to be, so this
+    /// refuses to type at all unless the app's focused element IS the
+    /// composer we resolved. Without that check a focus change between
+    /// resolving and typing would spray the message -- and a Select All
+    /// plus Delete -- into whatever took focus instead.
+    private static func typeIntoComposer(
+        _ editor: AccessibilityModule.Entry,
+        app: NSRunningApplication,
+        text: String
+    ) throws {
+        // Focus the composer, then confirm the app agrees it is focused.
+        try AccessibilityModule.check(
+            AXUIElementSetAttributeValue(editor.element, kAXFocusedAttribute as CFString, kCFBooleanTrue),
+            "Focus the message composer"
+        )
+
+        let root = AXUIElementCreateApplication(app.processIdentifier)
+        guard let focused = AccessibilityModule.elementAttribute(root, kAXFocusedUIElementAttribute),
+              CFEqual(focused, editor.element) else {
+            throw PowerError.message(
+                "The message composer did not take keyboard focus, so nothing was typed. "
+                + "Something else may have taken focus; re-read WhatsApp and try again."
+            )
+        }
+
+        // Replace whatever is already there. Select All + Delete is scoped
+        // to the focused text view, and we have just proved that is the
+        // composer. Done unconditionally: the composer reports its empty
+        // value inconsistently (sometimes "", sometimes " ", sometimes
+        // null), so "is it empty" is not reliably answerable, and Select
+        // All on an empty field is a no-op anyway.
+        _ = Keyboard.pressKey(args: ["key": "a", "modifiers": ["cmd"]])
+        usleep(60_000)
+        _ = Keyboard.pressKey(args: ["key": "delete"])
+        usleep(60_000)
+
+        let typed = Keyboard.typeText(args: ["text": text])
+        guard typed["ok"] as? Bool == true else {
+            throw PowerError.message(
+                "Could not type into the composer: \(typed["error"] as? String ?? "unknown error")"
+            )
+        }
+        usleep(250_000)   // let WhatsApp's UI catch up before anyone reads it back
+    }
+
     static func draft(args: [String: Any]) -> [String: Any] {
         PowerSupport.result {
             let text = try PowerSupport.text(args, "text")
             let (app, _, editor) = try context(args)
             try PowerSupport.ensureFrontmost(app.processIdentifier)
-            try AccessibilityModule.setText(editor, text: text)
-            return ["ok": true, "draftVerified": true, "sent": false, "note": "Refresh /whatsapp/read before sending"]
+            try typeIntoComposer(editor, app: app, text: text)
+
+            // Verify against what the composer actually holds now.
+            let actual = AccessibilityModule.string(editor.element, kAXValueAttribute) ?? ""
+            guard normalizedLabel(actual) == normalizedLabel(text) else {
+                throw PowerError.message(
+                    "Composer text does not match what was requested after typing "
+                    + "(found \(actual.debugDescription)). Nothing was sent; inspect the UI."
+                )
+            }
+
+            // The real proof that WhatsApp registered the text: the Send
+            // button only exists once it did. Reported so the caller knows
+            // whether sending is even possible, instead of discovering it
+            // by failing.
+            let sendButton = findSendButton(pid: app.processIdentifier)
+            return [
+                "ok": true,
+                "draftVerified": true,
+                "sent": false,
+                "sendButtonAvailable": sendButton != nil,
+                "note": sendButton != nil
+                    ? "Draft is in the composer and WhatsApp has registered it (the Send "
+                      + "button now exists). Re-read /whatsapp/read for fresh element IDs, "
+                      + "then call /whatsapp/send."
+                    : "Draft is in the composer but no Send button appeared, so WhatsApp may "
+                      + "not have registered the text. Re-read and inspect before sending."
+            ]
         }
+    }
+
+    /// Locates the composer's Send button by its stable accessibility
+    /// identifier. It only exists while the composer holds text.
+    private static func findSendButton(pid: pid_t) -> [String: Any]? {
+        let result = AccessibilityModule.find(args: [
+            "pid": Int(pid), "query": "ChatBar_SendButton", "maxNodes": 1500, "maxDepth": 20
+        ])
+        guard let rows = result["elements"] as? [[String: Any]] else { return nil }
+        return rows.first { ($0["identifier"] as? String) == "ChatBar_SendButton" }
     }
     static func send(args: [String: Any]) -> [String: Any] {
         PowerSupport.result {
@@ -169,19 +316,35 @@ enum WhatsAppModule {
             let labels = [kAXTitleAttribute, kAXDescriptionAttribute, kAXHelpAttribute].compactMap {
                 AccessibilityModule.string(send.element, $0)
             }
-            guard labels.contains(expectedLabel) else { throw PowerError.message("Send button label changed; inspect it and pass its exact expectedSendLabel") }
+            // Compared through normalizedLabel: WhatsApp's real label is
+            // "\u{200E}Send", so exact equality against "Send" rejected the
+            // genuine button every time. See normalizedLabel.
+            guard labelMatches(labels, expectedLabel) else {
+                throw PowerError.message(
+                    "Send button label is \(labels.map { $0.debugDescription }.joined(separator: ", ")), "
+                    + "which does not match expectedSendLabel \(expectedLabel.debugDescription). "
+                    + "Nothing was sent."
+                )
+            }
             guard let window = AccessibilityModule.elementAttribute(send.element, kAXWindowAttribute),
                   let editorWindow = AccessibilityModule.elementAttribute(editor.element, kAXWindowAttribute), CFEqual(window, editorWindow) else {
                 throw PowerError.message("Send button and composer belong to different windows")
             }
-            guard AccessibilityModule.string(editor.element, kAXValueAttribute) == expectedText else {
-                throw PowerError.message("Composer text does not exactly match expectedText; nothing was sent")
+            let composerText = AccessibilityModule.string(editor.element, kAXValueAttribute) ?? ""
+            guard normalizedLabel(composerText) == normalizedLabel(expectedText) else {
+                throw PowerError.message(
+                    "Composer holds \(composerText.debugDescription) but expectedText is "
+                    + "\(expectedText.debugDescription); nothing was sent"
+                )
             }
             // Recheck the header immediately before the side effect.
             let recipient = try PowerSupport.text(args, "expectedRecipient")
-            guard [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute].contains(where: {
-                AccessibilityModule.string(header.element, $0) == recipient
-            }) else { throw PowerError.message("Conversation changed; nothing was sent") }
+            let headerLabels = [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute].compactMap {
+                AccessibilityModule.string(header.element, $0)
+            }
+            guard labelMatches(headerLabels, recipient) else {
+                throw PowerError.message("Conversation changed; nothing was sent")
+            }
             try PowerSupport.ensureFrontmost(app.processIdentifier)
             try AccessibilityModule.check(AXUIElementPerformAction(send.element, kAXPressAction as CFString), "Press Send")
             return ["ok": true, "sendInvoked": true, "deliveryVerified": false,
