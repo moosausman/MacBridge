@@ -24,7 +24,18 @@ enum Safari {
          .replacingOccurrences(of: "\"", with: "\\\"")
     }
 
-    /// args: { "url": String }  — opens a new tab with the given URL.
+    /// args: { "url": String, "background": Bool? (default true) }
+    ///
+    /// Opens a tab in the BACKGROUND by default: Safari is not activated and
+    /// the new tab is not made current, so whatever the user is doing keeps
+    /// focus and nothing appears in front of them.
+    ///
+    /// This used to unconditionally `activate` Safari and `set current tab`,
+    /// so any lookup the assistant did mid-task yanked the user out of
+    /// whatever they were working on. Opening a page for later reference and
+    /// demanding the user look at it right now are different intentions, and
+    /// only the caller knows which one applies -- so it's an argument, and
+    /// the quieter of the two is the default.
     static func openURL(args: [String: Any]) -> [String: Any] {
         guard let urlString = args["url"] as? String, !urlString.isEmpty else {
             return ["ok": false, "error": "'url' is required"]
@@ -33,19 +44,45 @@ enum Safari {
             return ["ok": false, "error": "'url' is not a valid URL"]
         }
 
+        let background = (args["background"] as? Bool) ?? true
         let escapedURL = escapeForAppleScript(urlString)
-        let script = """
+
+        // With no window open there is nothing to add a tab to, and `make new
+        // document` unavoidably surfaces Safari. That case is reported rather
+        // than pretended about, so "background" never silently lies.
+        let script = background ? """
+tell application "Safari"
+    if (count of windows) = 0 then
+        make new document with properties {URL:"\(escapedURL)"}
+        return "opened-window"
+    else
+        tell window 1 to make new tab with properties {URL:"\(escapedURL)"}
+        return "opened-background-tab"
+    end if
+end tell
+""" : """
 tell application "Safari"
     activate
     if (count of windows) = 0 then
         make new document
     end if
     tell window 1 to set current tab to (make new tab with properties {URL:"\(escapedURL)"})
+    return "opened-foreground-tab"
 end tell
 """
         switch runScript(script) {
-        case .success: return ["ok": true, "url": urlString]
-        case .failure(let scriptError): return ["ok": false, "error": scriptError.message]
+        case .success(let outcome):
+            let mode = outcome ?? "opened"
+            var result: [String: Any] = ["ok": true, "url": urlString, "outcome": mode]
+            result["background"] = (mode == "opened-background-tab")
+            if mode == "opened-window" {
+                result["note"] = "Safari had no window open, so a new one was created and is "
+                               + "visible. A background tab isn't possible with no window to "
+                               + "put it in."
+            }
+            return result
+        case .failure(let scriptError):
+            return ["ok": false, "error": scriptError.message]
         }
     }
 
