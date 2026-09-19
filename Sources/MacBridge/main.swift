@@ -125,9 +125,17 @@ func requestAllPermissions(completion: @escaping () -> Void) {
 // ── HTTP server ────────────────────────────────────────────────────────────
 private var server: MacBridgeServer?
 
+// Port is configurable so a SECOND instance can run in another user's login
+// session without colliding with this one. macOS ties GUI automation to a
+// session -- Apple Events, the accessibility tree, the keyboard, mouse and
+// screen all belong to exactly one -- so acting as another user means a
+// whole separate MacBridge living inside that user's session, answering on
+// its own port. See setup-agent-session.sh.
+let listenPort = UInt16(ProcessInfo.processInfo.environment["MACBRIDGE_PORT"] ?? "") ?? 8765
+
 requestAllPermissions {
-    server = MacBridgeServer(port: 8765)
-    print("🚀 MacBridge running on http://localhost:8765")
+    server = MacBridgeServer(port: listenPort)
+    print("🚀 MacBridge running on http://localhost:\(listenPort)")
     server?.start()
 }
 
