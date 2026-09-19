@@ -1,0 +1,12 @@
+# Build output. Rebuilt by ./build.sh; never commit it.
+# Note: the built bundle deliberately stays on disk between builds so macOS
+# keeps its TCC grants (Automation, Accessibility, Screen Recording) tied to
+# the same code signature -- it's ignored here, not deleted.
+MacBridge.app/
+
+# macOS
+.DS_Store
+
+# Leftover runtime state from the old single-agent "Jarvis" architecture.
+# Jugnu keeps its real data in ~/Library/Application Support/Jugnu.
+memory/

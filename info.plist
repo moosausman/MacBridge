@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>MacBridge</string>
+
+    <key>CFBundleDisplayName</key>
+    <string>MacBridge</string>
+
+    <key>CFBundleIdentifier</key>
+    <string>com.jarvis.macbridge</string>
+
+    <key>CFBundleVersion</key>
+    <string>1.0</string>
+
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+
+    <key>CFBundleExecutable</key>
+    <string>MacBridge</string>
+
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+
+    <key>LSUIElement</key>
+    <true/>
+
+    <key>NSAppleEventsUsageDescription</key>
+    <string>MacBridge controls applications such as Safari, Mail, Finder, Terminal, and System Events when you request an action.</string>
+
+    <key>NSCalendarsFullAccessUsageDescription</key>
+    <string>MacBridge needs full Calendar access to read, create, update, and delete events on your behalf.</string>
+
+    <key>NSCalendarsUsageDescription</key>
+    <string>MacBridge needs Calendar access to read and manage events on your behalf.</string>
+
+    <key>NSRemindersFullAccessUsageDescription</key>
+    <string>MacBridge needs full Reminders access to read, create, update, and delete reminders on your behalf.</string>
+
+    <key>NSRemindersUsageDescription</key>
+    <string>MacBridge needs Reminders access to read and manage reminders on your behalf.</string>
+
+    <key>NSContactsUsageDescription</key>
+    <string>MacBridge needs Contacts access to search and use your contacts when requested.</string>
+</dict>
+</plist>
