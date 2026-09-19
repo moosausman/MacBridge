@@ -36,17 +36,37 @@ enum Notifications {
         let request = UNNotificationRequest(identifier: requestId, content: content, trigger: trigger)
 
         let semaphore = DispatchSemaphore(value: 0)
+        let lock = NSLock()
         var dispatchError: Error?
 
         UNUserNotificationCenter.current().add(request) { error in
-            dispatchError = error
+            lock.lock(); dispatchError = error; lock.unlock()
             semaphore.signal()
         }
 
-        semaphore.wait()
+        // Bounded wait. This was a bare semaphore.wait() -- every other
+        // blocking wait in this codebase carries a timeout, and this one
+        // didn't. A notification centre that never calls back (it lives in
+        // another process, and does get wedged) would hold one of
+        // Server.swift's 16 client slots and its thread forever, with no
+        // way to reclaim either short of restarting MacBridge.
+        //
+        // Timing out here doesn't cancel the request -- the banner may
+        // still appear -- so the response says so rather than claiming
+        // failure.
+        guard semaphore.wait(timeout: .now() + 10) == .success else {
+            return ["ok": false, "id": requestId,
+                    "error": "Notification centre did not respond within 10s. "
+                           + "The notification may still be delivered; this call "
+                           + "stopped waiting for confirmation."]
+        }
 
-        if let dispatchError {
-            return ["ok": false, "error": "Failed to schedule notification: \(dispatchError.localizedDescription)"]
+        lock.lock()
+        let failure = dispatchError
+        lock.unlock()
+
+        if let failure {
+            return ["ok": false, "error": "Failed to schedule notification: \(failure.localizedDescription)"]
         }
         return ["ok": true, "id": requestId]
     }

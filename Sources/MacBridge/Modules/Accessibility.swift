@@ -2,6 +2,26 @@ import Foundation
 import AppKit
 import ApplicationServices
 
+/// Hashable wrapper around AXUIElement so it can live in a Set.
+///
+/// AXUIElement is a CFType: it has CFHash/CFEqual but no Swift Hashable
+/// conformance, and identical elements can be distinct CF instances, so
+/// pointer identity is not enough -- CFEqual is the correct comparison and
+/// CFHash is consistent with it.
+private struct AXElementKey: Hashable {
+    let element: AXUIElement
+
+    init(_ element: AXUIElement) { self.element = element }
+
+    static func == (lhs: AXElementKey, rhs: AXElementKey) -> Bool {
+        CFEqual(lhs.element, rhs.element)
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(CFHash(element))
+    }
+}
+
 enum AccessibilityModule {
     struct Entry {
         let element: AXUIElement
@@ -83,12 +103,20 @@ enum AccessibilityModule {
             let snapshotId = UUID().uuidString, now = Date(), deadline = Date().addingTimeInterval(timeout)
             var queue: [(AXUIElement, Int, String?)] = [(root, 0, nil)]
             var cursor = 0, rows: [[String: Any]] = []
-            var visited: [AXUIElement] = []
+            // Hash-based membership instead of a linear scan. This was
+            // `var visited: [AXUIElement]` checked with
+            // `visited.contains(where: { CFEqual($0, element) })` -- an O(n)
+            // walk per node, so O(n²) overall, with a CFEqual call at every
+            // step. At the documented ceilings (1500 nodes, a queue up to
+            // 4500) that's millions of CFEqual calls against a live
+            // accessibility tree, and it ran inside the traversal deadline,
+            // so on a big app (Xcode, a browser) the cost showed up as
+            // snapshots coming back `truncated` rather than as slowness.
+            var visited = Set<AXElementKey>()
             var newEntries: [String: Entry] = [:], truncated = false
             while cursor < queue.count && rows.count < maxNodes && Date() < deadline {
                 let (element, depth, parent) = queue[cursor]; cursor += 1
-                guard !visited.contains(where: { CFEqual($0, element) }) else { continue }
-                visited.append(element)
+                guard visited.insert(AXElementKey(element)).inserted else { continue }
                 AXUIElementSetMessagingTimeout(element, 0.15)
                 let id = snapshotId + ":" + String(rows.count)
                 var row = describe(element)

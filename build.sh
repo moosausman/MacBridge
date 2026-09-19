@@ -7,7 +7,11 @@ cd "${SCRIPT_DIR}"
 APP_NAME="MacBridge"
 BUNDLE="${APP_NAME}.app"
 SRC_DIR="Sources/MacBridge"
-INFO_PLIST="Info.plist"
+# The file on disk is lowercase `info.plist`. That only works because
+# macOS volumes are case-insensitive by default -- on a case-sensitive
+# APFS volume (or in CI) the existence check below fails and the build
+# stops with "Missing required path: Info.plist".
+INFO_PLIST="info.plist"
 ENTITLEMENTS="MacBridge.entitlements"
 
 # A stable signing identity prevents each rebuild from appearing as a new app

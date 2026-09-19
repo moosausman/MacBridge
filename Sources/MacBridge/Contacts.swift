@@ -49,7 +49,10 @@ enum ContactsModule {
 
     /// args: { "limit": Int? (default 100) }
     static func list(args: [String: Any]) -> [String: Any] {
-        let limit = args["limit"] as? Int ?? 100
+        // Unvalidated JSON: a negative limit made the `>= limit` check below
+        // true on the very first contact, so it returned an empty list and
+        // reported success.
+        let limit = max(1, min(args["limit"] as? Int ?? 100, 2000))
         let request = CNContactFetchRequest(keysToFetch: keysToFetch)
         var results: [[String: Any]] = []
 
@@ -60,7 +63,22 @@ enum ContactsModule {
             }
             return ["ok": true, "contacts": results]
         } catch {
-            return ["ok": false, "error": "Contact list failed: \(error.localizedDescription)"]
+            // enumerateContacts needs FULL Contacts access, while
+            // contacts_search's unifiedContacts(matching:) is satisfied by
+            // limited access -- so search working is not evidence that this
+            // will. The raw error for that case is the bare string "Access
+            // Denied", which tells nobody what to actually do about it.
+            let raw = error.localizedDescription
+            if raw.localizedCaseInsensitiveContains("denied")
+                || (error as NSError).domain == CNErrorDomain {
+                return ["ok": false,
+                        "error": "Contacts access denied. Grant MacBridge full access in "
+                               + "System Settings > Privacy & Security > Contacts, then "
+                               + "restart MacBridge. (contacts_search may still work -- it "
+                               + "only needs limited access.) Underlying error: \(raw)",
+                        "permission": "contacts"]
+            }
+            return ["ok": false, "error": "Contact list failed: \(raw)"]
         }
     }
 }

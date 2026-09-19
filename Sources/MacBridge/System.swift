@@ -8,17 +8,14 @@ import Foundation
 
 enum System {
 
-    private static func runScript(_ source: String) -> Result<String?, String> {
-        guard let appleScript = NSAppleScript(source: source) else {
-            return .failure("Failed to parse internal script")
-        }
-        var errorInfo: NSDictionary?
-        let result = appleScript.executeAndReturnError(&errorInfo)
-        if let errorInfo {
-            let message = errorInfo[NSAppleScript.errorMessage] as? String ?? "Unknown system error"
-            return .failure(message)
-        }
-        return .success(result.stringValue)
+    /// Delegates to AppleScriptRunner: main-thread execution with a
+    /// wall-clock timeout. This used to call
+    /// `NSAppleScript.executeAndReturnError` directly on the request's
+    /// background thread with no timeout, which could hang forever and --
+    /// because Server.swift serialises UI routes behind `uiLock` -- take
+    /// every other UI route down with it. See AppleScriptRunner.
+    private static func runScript(_ source: String) -> Result<String?, ScriptError> {
+        AppleScriptRunner.runForString(source, appName: "System Events")
     }
 
     /// args: { "level": Int }  — 0 to 100
@@ -29,7 +26,7 @@ enum System {
 
         switch runScript("set volume output volume \(level)") {
         case .success: return ["ok": true, "level": level]
-        case .failure(let message): return ["ok": false, "error": message]
+        case .failure(let scriptError): return ["ok": false, "error": scriptError.message]
         }
     }
 
@@ -41,8 +38,8 @@ enum System {
                 return ["ok": false, "error": "Unexpected response reading volume"]
             }
             return ["ok": true, "level": level]
-        case .failure(let message):
-            return ["ok": false, "error": message]
+        case .failure(let scriptError):
+            return ["ok": false, "error": scriptError.message]
         }
     }
 
@@ -80,7 +77,7 @@ enum System {
     static func sleep(args: [String: Any]) -> [String: Any] {
         switch runScript("tell application \"System Events\" to sleep") {
         case .success: return ["ok": true]
-        case .failure(let message): return ["ok": false, "error": message]
+        case .failure(let scriptError): return ["ok": false, "error": scriptError.message]
         }
     }
 
@@ -88,7 +85,7 @@ enum System {
     static func lock(args: [String: Any]) -> [String: Any] {
         switch runScript("tell application \"System Events\" to keystroke \"q\" using {control down, command down}") {
         case .success: return ["ok": true]
-        case .failure(let message): return ["ok": false, "error": message]
+        case .failure(let scriptError): return ["ok": false, "error": scriptError.message]
         }
     }
 }

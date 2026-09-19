@@ -18,16 +18,21 @@ enum AppleScriptModule {
             return ["ok": false, "error": "'script' is required"]
         }
 
-        guard let appleScript = NSAppleScript(source: source) else {
-            return ["ok": false, "error": "Failed to parse script"]
+        // Same main-thread + timeout treatment as every other AppleScript
+        // path here. This route runs caller-supplied script text, so it is
+        // the single most likely one to block on a permission prompt or an
+        // unresponsive app -- and it holds `uiLock` while it does.
+        let (result, error) = AppleScriptRunner.run(
+            source,
+            timeout: 45,   // caller-supplied scripts can legitimately be slow
+            appName: "The script's target application"
+        )
+
+        if let error {
+            return ["ok": false, "error": error]
         }
-
-        var errorInfo: NSDictionary?
-        let result = appleScript.executeAndReturnError(&errorInfo)
-
-        if let errorInfo {
-            let message = errorInfo[NSAppleScript.errorMessage] as? String ?? "Unknown AppleScript error"
-            return ["ok": false, "error": message]
+        guard let result else {
+            return ["ok": false, "error": "Script returned no result"]
         }
 
         // NSAppleEventDescriptor doesn't map cleanly to JSON; surface what

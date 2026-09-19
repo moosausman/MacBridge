@@ -21,6 +21,35 @@ enum Files {
         return path
     }
 
+    /// Ceiling on a whole-file read into memory.
+    ///
+    /// This is a CRASH GUARD, not an access restriction -- no path is off
+    /// limits, and this is one constant to change or delete. It exists
+    /// because read/search/hash/diff/findReplace all use
+    /// `FileManager.contents(atPath:)`, which materializes the entire file
+    /// at once: a single file_read of a multi-GB log or disk image would
+    /// exhaust MacBridge's memory and take the process down -- and with it
+    /// every one of the ~130 tools that route through this server, not just
+    /// the read that caused it.
+    ///
+    /// 512MB is far past any text file worth reading and still nowhere near
+    /// dangerous. The streaming routes (preview, head, tail, countLines,
+    /// readRange) are unaffected and already handle multi-GB files fine --
+    /// they're what the error below points callers at.
+    static let maxInMemoryReadBytes = 512 * 1024 * 1024
+
+    /// Returns an error dict if `fullPath` is too large to load whole, else nil.
+    private static func rejectIfTooLarge(_ fullPath: String, _ displayPath: String) -> [String: Any]? {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: fullPath),
+              let size = attrs[.size] as? Int, size > maxInMemoryReadBytes else { return nil }
+        let mb = size / (1024 * 1024)
+        return ["ok": false,
+                "error": "\(displayPath) is \(mb)MB, over the \(maxInMemoryReadBytes / 1024 / 1024)MB "
+                       + "whole-file read limit. Use file_preview, file_head, file_tail or "
+                       + "file_read_range instead -- those stream and handle files of any size.",
+                "sizeBytes": size]
+    }
+
     /// Best-effort categorization bucket for a file extension.
     private static func category(forExtension ext: String) -> String {
         switch ext.lowercased() {
@@ -129,6 +158,8 @@ enum Files {
         }
 
         let fullPath = expand(path)
+
+        if let tooLarge = rejectIfTooLarge(fullPath, path) { return tooLarge }
 
         guard let data = FileManager.default.contents(atPath: fullPath) else {
             return ["ok": false, "error": "Could not read file at \(path)"]
@@ -642,6 +673,15 @@ enum Files {
             }
 
             if let contains {
+                // Skip anything too big to load whole. A content search walks
+                // a whole directory tree, so without this one stray disk
+                // image or database file in the path is enough to exhaust
+                // memory -- and it would never have matched a text search
+                // anyway. group() above already does the same thing with its
+                // own 50MB hashing cap.
+                if let size = item["size"] as? Int, size > maxInMemoryReadBytes {
+                    continue
+                }
                 guard let data = FileManager.default.contents(atPath: fullPath),
                       let text = String(data: data, encoding: .utf8),
                       text.localizedCaseInsensitiveContains(contains) else {
@@ -848,6 +888,11 @@ enum Files {
             return ["ok": false, "error": "'startLine'/'endLine' must satisfy 1 <= startLine <= endLine"]
         }
 
+        // Line addressing needs the whole file in memory to count newlines;
+        // only the startByte/endByte branch above can seek. Callers wanting a
+        // slice of something enormous should use byte offsets, or tail/head.
+        if let tooLarge = rejectIfTooLarge(fullPath, path) { return tooLarge }
+
         guard let data = FileManager.default.contents(atPath: fullPath),
               let text = String(data: data, encoding: .utf8) else {
             return ["ok": false, "error": "Could not read file at \(path) as UTF-8 text"]
@@ -882,6 +927,8 @@ enum Files {
         let isRegex = args["isRegex"] as? Bool ?? false
         let dryRun = args["dryRun"] as? Bool ?? false
         let fullPath = expand(path)
+
+        if let tooLarge = rejectIfTooLarge(fullPath, path) { return tooLarge }
 
         guard let data = FileManager.default.contents(atPath: fullPath),
               let text = String(data: data, encoding: .utf8) else {
@@ -922,6 +969,8 @@ enum Files {
             return ["ok": false, "error": "'path' is required"]
         }
         let fullPath = expand(path)
+
+        if let tooLarge = rejectIfTooLarge(fullPath, path) { return tooLarge }
         let algorithm = (args["algorithm"] as? String ?? "sha256").lowercased()
 
         guard let data = FileManager.default.contents(atPath: fullPath) else {
@@ -974,6 +1023,9 @@ enum Files {
             return ["ok": false, "error": "'pathB' is required"]
         }
         let maxLines = args["maxLines"] as? Int ?? 2000
+
+        if let tooLarge = rejectIfTooLarge(expand(pathA), pathA) { return tooLarge }
+        if let tooLarge = rejectIfTooLarge(expand(pathB), pathB) { return tooLarge }
 
         guard let dataA = FileManager.default.contents(atPath: expand(pathA)),
               let textA = String(data: dataA, encoding: .utf8) else {

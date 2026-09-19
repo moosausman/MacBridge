@@ -7,17 +7,24 @@ import Foundation
 
 enum Mail {
 
-    private static func runScript(_ source: String) -> Result<String?, String> {
-        guard let appleScript = NSAppleScript(source: source) else {
-            return .failure("Failed to parse internal script")
-        }
-        var errorInfo: NSDictionary?
-        let result = appleScript.executeAndReturnError(&errorInfo)
-        if let errorInfo {
-            let message = errorInfo[NSAppleScript.errorMessage] as? String ?? "Unknown Mail error"
-            return .failure(message)
-        }
-        return .success(result.stringValue)
+    /// Delegates to AppleScriptRunner: main-thread execution with a
+    /// wall-clock timeout. This used to call
+    /// `NSAppleScript.executeAndReturnError` directly on the request's
+    /// background thread with no timeout, which could hang forever and --
+    /// because Server.swift serialises UI routes behind `uiLock` -- take
+    /// every other UI route down with it. See AppleScriptRunner.
+    /// 60s rather than the shared 20s default. Reading a message's
+    /// properties costs an Apple Event round trip each (~0.4s measured
+    /// against a 26k-message inbox), so a 50-message list legitimately
+    /// needs ~20s and would otherwise trip the default ceiling.
+    ///
+    /// Safe to be this generous specifically because /mail/ is NOT one of
+    /// Server.swift's `isUI` routes: a slow Mail call occupies its own
+    /// client slot but never holds `uiLock`, so it cannot block the
+    /// mouse/keyboard/accessibility routes the way a wedged Safari call
+    /// could.
+    private static func runScript(_ source: String) -> Result<String?, ScriptError> {
+        AppleScriptRunner.runForString(source, timeout: 60, appName: "Mail")
     }
 
     private static func escape(_ s: String) -> String {
@@ -27,13 +34,37 @@ enum Mail {
 
     /// args: { "limit": Int? (default 20) } — most recent messages in the inbox.
     static func list(args: [String: Any]) -> [String: Any] {
-        let limit = args["limit"] as? Int ?? 20
+        // Clamp rather than trust: `limit` arrives as unvalidated JSON and
+        // went straight into the script below, so a negative or absurd
+        // value produced a nonsense AppleScript range.
+        //
+        // The ceiling is 50 because this costs
+        // roughly 0.2s PER MESSAGE and the client's default timeout is 20s.
+        //
+        // That per-message cost is inherent: reading `subject of m` inside
+        // the loop is one Apple Event round trip each. The obvious fix --
+        // bulk column reads, `set subjectList to subject of msgs` -- does
+        // not work here and was tried: `inbox` is the unified mailbox, so
+        // the range resolves to specifiers spanning several accounts'
+        // mailboxes and Mail answers "Can't get subject of {message id N of
+        // mailbox ...}". Reading per message is what actually works against
+        // a unified inbox, so the limit is bounded to match instead.
+        //
+        // Separately: `messages 1 thru N` raises "Can't get message N of
+        // inbox" whenever the inbox holds fewer than N messages, so a nearly
+        // empty mailbox errored instead of returning what was there.
+        // Clamping against the real count makes the range always valid.
+        let limit = max(1, min(args["limit"] as? Int ?? 20, 50))
 
         let script = """
         tell application "Mail"
             set output to ""
-            set msgs to messages 1 thru \(limit) of inbox
-            repeat with m in msgs
+            set n to count of messages of inbox
+            if n is 0 then return ""
+            set upperBound to \(limit)
+            if upperBound > n then set upperBound to n
+            repeat with i from 1 to upperBound
+                set m to message i of inbox
                 set output to output & (subject of m) & "@@@" & (sender of m) & "@@@" & ¬
                     ((date received of m) as string) & "@@@" & (read status of m as string) & "###"
             end repeat
@@ -42,8 +73,8 @@ enum Mail {
         """
 
         switch runScript(script) {
-        case .failure(let message):
-            return ["ok": false, "error": message]
+        case .failure(let scriptError):
+            return ["ok": false, "error": scriptError.message]
         case .success(let value):
             guard let value, !value.isEmpty else {
                 return ["ok": true, "messages": []]
@@ -69,28 +100,42 @@ enum Mail {
         guard let query = args["query"] as? String, !query.isEmpty else {
             return ["ok": false, "error": "'query' is required"]
         }
-        let limit = args["limit"] as? Int ?? 20
+        let limit = max(1, min(args["limit"] as? Int ?? 20, 50))
 
+        // `whose` is the real fix here, and it's a large one.
+        //
+        // The old version did `set msgs to messages of inbox` and then read
+        // `subject of m` for EVERY message in the mailbox just to test the
+        // match -- one Apple Event round trip each. Against the 26k-message
+        // inbox this was measured on, at ~0.2s per message, that is well
+        // over an hour, holding one of Server.swift's 16 client slots the
+        // entire time. It could never have returned within any timeout.
+        //
+        // A `whose` clause is evaluated inside Mail and returns only the
+        // matches, so the expensive per-message reads below run over a
+        // handful of results rather than the whole mailbox. (Reading them
+        // per message rather than as bulk columns is deliberate -- see
+        // list() for why bulk reads fail against the unified inbox.)
         let script = """
         tell application "Mail"
             set output to ""
-            set matchCount to 0
-            set msgs to messages of inbox
-            repeat with m in msgs
-                if subject of m contains "\(escape(query))" then
-                    set output to output & (subject of m) & "@@@" & (sender of m) & "@@@" & ¬
-                        ((date received of m) as string) & "###"
-                    set matchCount to matchCount + 1
-                    if matchCount ≥ \(limit) then exit repeat
-                end if
+            set matches to (messages of inbox whose subject contains "\(escape(query))")
+            set matchCount to count of matches
+            if matchCount is 0 then return ""
+            set upperBound to \(limit)
+            if upperBound > matchCount then set upperBound to matchCount
+            repeat with i from 1 to upperBound
+                set m to item i of matches
+                set output to output & (subject of m) & "@@@" & (sender of m) & "@@@" & ¬
+                    ((date received of m) as string) & "###"
             end repeat
             return output
         end tell
         """
 
         switch runScript(script) {
-        case .failure(let message):
-            return ["ok": false, "error": message]
+        case .failure(let scriptError):
+            return ["ok": false, "error": scriptError.message]
         case .success(let value):
             guard let value, !value.isEmpty else {
                 return ["ok": true, "messages": []]
@@ -131,7 +176,7 @@ enum Mail {
 
         switch runScript(script) {
         case .success: return ["ok": true, "to": to, "subject": subject]
-        case .failure(let message): return ["ok": false, "error": message]
+        case .failure(let scriptError): return ["ok": false, "error": scriptError.message]
         }
     }
 }

@@ -6,17 +6,14 @@ import Foundation
 
 enum Safari {
 
-    private static func runScript(_ source: String) -> Result<String?, String> {
-        guard let appleScript = NSAppleScript(source: source) else {
-            return .failure("Failed to parse internal script")
-        }
-        var errorInfo: NSDictionary?
-        let result = appleScript.executeAndReturnError(&errorInfo)
-        if let errorInfo {
-            let message = errorInfo[NSAppleScript.errorMessage] as? String ?? "Unknown Safari error"
-            return .failure(message)
-        }
-        return .success(result.stringValue)
+    /// Delegates to AppleScriptRunner: main-thread execution with a
+    /// wall-clock timeout. This used to call
+    /// `NSAppleScript.executeAndReturnError` directly on the request's
+    /// background thread with no timeout, which could hang forever and --
+    /// because Server.swift serialises UI routes behind `uiLock` -- take
+    /// every other UI route down with it. See AppleScriptRunner.
+    private static func runScript(_ source: String) -> Result<String?, ScriptError> {
+        AppleScriptRunner.runForString(source, appName: "Safari")
     }
 
     /// Escapes a string for safe use inside an *AppleScript* string literal
@@ -48,7 +45,7 @@ end tell
 """
         switch runScript(script) {
         case .success: return ["ok": true, "url": urlString]
-        case .failure(let message): return ["ok": false, "error": message]
+        case .failure(let scriptError): return ["ok": false, "error": scriptError.message]
         }
     }
 
@@ -67,8 +64,8 @@ end tell
         """
 
         switch runScript(script) {
-        case .failure(let message):
-            return ["ok": false, "error": message]
+        case .failure(let scriptError):
+            return ["ok": false, "error": scriptError.message]
         case .success(let value):
             guard let value, !value.isEmpty else {
                 return ["ok": true, "tabs": []]
@@ -94,8 +91,8 @@ end tell
         """
 
         switch runScript(script) {
-        case .failure(let message):
-            return ["ok": false, "error": message]
+        case .failure(let scriptError):
+            return ["ok": false, "error": scriptError.message]
         case .success(let value):
             guard let value else {
                 return ["ok": false, "error": "No frontmost Safari tab"]

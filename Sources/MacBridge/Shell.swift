@@ -50,6 +50,12 @@ import AppKit
 
 enum Shell {
 
+    /// Absolute ceiling on how long a *blocking* run (run / runScript) may
+    /// occupy one of Server.swift's 16 client slots. See execute() for why
+    /// an unbounded wait was a whole-server availability problem rather
+    /// than just a slow call.
+    private static let maxExecuteTimeout: Double = 1800  // 30 minutes
+
     // ── Staged execution — opens Terminal, writes, waits for a human ──────
 
     /// args: { "command": String, "cwd": String?, "autoRun": Bool? }
@@ -259,20 +265,85 @@ enum Shell {
     // away; poll status, stop with kill. Jobs live only in memory — they
     // don't survive a MacBridge restart.
 
+    /// Cap on captured output per stream, per job. A spawned dev server or
+    /// watcher can log steadily for hours; without a bound, `stdout` here
+    /// grew forever in memory with nothing ever trimming or rotating it.
+    /// Keeping the TAIL rather than the head is deliberate -- for a
+    /// long-running process the recent lines are the interesting ones.
+    private static let maxJobOutputBytes = 256 * 1024
+
+    /// How long a finished job stays queryable before it's swept. Jobs were
+    /// previously never removed from `jobs` at all: every spawn leaked its
+    /// Job, its Process, and its accumulated output for the lifetime of the
+    /// server. Ten minutes is long enough to collect a result at leisure.
+    private static let finishedJobRetention: TimeInterval = 600
+
     private final class Job {
         let process: Process
-        var stdout = Data()
-        var stderr = Data()
+        private(set) var stdout = Data()
+        private(set) var stderr = Data()
+        private(set) var stdoutTruncated = false
+        private(set) var stderrTruncated = false
         let lock = NSLock()
         let command: String
+        var finishedAt: Date?
+
         init(process: Process, command: String) {
             self.process = process
             self.command = command
+        }
+
+        /// Appends, then trims from the front so the buffer holds at most
+        /// `maxJobOutputBytes` -- a sliding window over the most recent
+        /// output rather than an unbounded transcript.
+        func append(_ chunk: Data, toStdout: Bool) {
+            guard !chunk.isEmpty else { return }
+            lock.lock()
+            defer { lock.unlock() }
+            if toStdout {
+                stdout.append(chunk)
+                if stdout.count > Shell.maxJobOutputBytes {
+                    stdout.removeFirst(stdout.count - Shell.maxJobOutputBytes)
+                    stdoutTruncated = true
+                }
+            } else {
+                stderr.append(chunk)
+                if stderr.count > Shell.maxJobOutputBytes {
+                    stderr.removeFirst(stderr.count - Shell.maxJobOutputBytes)
+                    stderrTruncated = true
+                }
+            }
+        }
+
+        func snapshot() -> (out: String, err: String, outTrunc: Bool, errTrunc: Bool) {
+            lock.lock()
+            defer { lock.unlock() }
+            return (String(data: stdout, encoding: .utf8) ?? "",
+                    String(data: stderr, encoding: .utf8) ?? "",
+                    stdoutTruncated, stderrTruncated)
         }
     }
 
     private static var jobs: [String: Job] = [:]
     private static let jobsLock = NSLock()
+
+    /// Drops finished jobs whose retention window has passed. Called from
+    /// spawn/jobList, so housekeeping rides along with normal traffic and
+    /// needs no timer of its own. Caller must NOT already hold jobsLock.
+    private static func sweepFinishedJobs() {
+        let now = Date()
+        jobsLock.lock()
+        defer { jobsLock.unlock() }
+        for (id, job) in jobs {
+            if job.finishedAt == nil, !job.process.isRunning {
+                job.finishedAt = now          // first sighting of the exit
+            }
+            if let finished = job.finishedAt,
+               now.timeIntervalSince(finished) > finishedJobRetention {
+                jobs.removeValue(forKey: id)
+            }
+        }
+    }
 
     /// args: { "command": String, "cwd": String?, "env": [String:String]? }
     /// Starts `command` detached via /bin/zsh -c and returns a jobId right
@@ -287,11 +358,18 @@ enum Shell {
             return ["ok": false, "error": "cwd does not exist: \(cwd)"]
         }
 
+        sweepFinishedJobs()
+
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")
         process.arguments = ["-c", command]
         process.currentDirectoryURL = URL(fileURLWithPath: cwd)
         process.environment = mergedEnvironment(args["env"] as? [String: String])
+
+        // Detach stdin. A spawned job has no console; leaving it inheriting
+        // MacBridge's stdin lets an interactive command block forever
+        // waiting for input nobody can supply.
+        process.standardInput = FileHandle.nullDevice
 
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
@@ -300,12 +378,22 @@ enum Shell {
 
         let job = Job(process: process, command: command)
         stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
-            let chunk = handle.availableData
-            job.lock.lock(); job.stdout.append(chunk); job.lock.unlock()
+            job.append(handle.availableData, toStdout: true)
         }
         stderrPipe.fileHandleForReading.readabilityHandler = { handle in
-            let chunk = handle.availableData
-            job.lock.lock(); job.stderr.append(chunk); job.lock.unlock()
+            job.append(handle.availableData, toStdout: false)
+        }
+
+        // Tear the readers down when the process exits. Leaving a
+        // readabilityHandler installed on a closed pipe keeps a dispatch
+        // source (and the FileHandle) alive indefinitely -- another slow
+        // leak, one per spawned job.
+        process.terminationHandler = { [weak job] _ in
+            stdoutPipe.fileHandleForReading.readabilityHandler = nil
+            stderrPipe.fileHandleForReading.readabilityHandler = nil
+            jobsLock.lock()
+            job?.finishedAt = Date()
+            jobsLock.unlock()
         }
 
         do {
@@ -340,10 +428,7 @@ enum Shell {
             return ["ok": false, "error": "Unknown jobId"]
         }
 
-        job.lock.lock()
-        let outStr = String(data: job.stdout, encoding: .utf8) ?? ""
-        let errStr = String(data: job.stderr, encoding: .utf8) ?? ""
-        job.lock.unlock()
+        let captured = job.snapshot()
 
         let running = job.process.isRunning
         var result: [String: Any] = [
@@ -352,9 +437,17 @@ enum Shell {
             "command": job.command,
             "running": running,
             "pid": Int(job.process.processIdentifier),
-            "stdout": outStr,
-            "stderr": errStr
+            "stdout": captured.out,
+            "stderr": captured.err
         ]
+        // Say so when output was dropped, rather than silently handing back
+        // a window and letting the caller believe it's the whole transcript.
+        if captured.outTrunc || captured.errTrunc {
+            result["truncated"] = true
+            result["note"] = "Output exceeded \(maxJobOutputBytes / 1024)KB per stream; " +
+                             "showing the most recent portion only. Redirect to a file " +
+                             "in the command itself if you need the full log."
+        }
         if !running {
             result["exitCode"] = Int(job.process.terminationStatus)
         }
@@ -374,17 +467,52 @@ enum Shell {
         }
 
         let sig = (args["signal"] as? String)?.lowercased() ?? "term"
-        if sig == "kill" {
-            kill(job.process.processIdentifier, SIGKILL)
-        } else {
-            job.process.terminate()
+        guard ["term", "kill"].contains(sig) else {
+            return ["ok": false, "error": "signal must be \"term\" or \"kill\""]
         }
-        return ["ok": true, "jobId": jobId, "signaled": sig]
+        guard job.process.isRunning else {
+            return ["ok": true, "jobId": jobId, "signaled": sig,
+                    "note": "Job had already exited; nothing to signal",
+                    "exitCode": Int(job.process.terminationStatus)]
+        }
+
+        let pid = job.process.processIdentifier
+        let signalNumber = (sig == "kill") ? SIGKILL : SIGTERM
+
+        // Signal the process GROUP first (negative pid), then the process
+        // itself as a fallback.
+        //
+        // The command runs as `/bin/zsh -c "<command>"`, and zsh commonly
+        // exec's straight into a single command or forks children for a
+        // pipeline. Signalling only the zsh pid -- which is what
+        // Process.terminate() and the old kill(pid, SIGKILL) both did --
+        // reaped the wrapper and left whatever it had started still running,
+        // reparented to launchd: invisible to shell_jobs, and unkillable
+        // through this API. "Kill the dev server" appeared to work and
+        // didn't, and the port stayed bound.
+        //
+        // killpg only reaches a separate group if the child actually made
+        // one; when it hasn't, ESRCH comes back and the direct kill below
+        // does the job. Both are attempted, and success of either counts.
+        let groupResult = killpg(pid, signalNumber)
+        let directResult = kill(pid, signalNumber)
+
+        guard groupResult == 0 || directResult == 0 else {
+            return ["ok": false, "jobId": jobId,
+                    "error": "Could not signal pid \(pid) (errno \(errno))"]
+        }
+
+        return ["ok": true, "jobId": jobId, "signaled": sig, "pid": Int(pid),
+                "signaledProcessGroup": groupResult == 0,
+                "note": "Signal delivered. A process can ignore SIGTERM -- " +
+                        "poll shell_job_status to confirm it actually exited, " +
+                        "and use signal=\"kill\" if it didn't."]
     }
 
     /// args: {}
     /// Lists every job spawned this run, with pid and running state.
     static func jobList(args: [String: Any]) -> [String: Any] {
+        sweepFinishedJobs()
         jobsLock.lock()
         let list: [[String: Any]] = jobs.map { id, job in
             [
@@ -395,7 +523,9 @@ enum Shell {
             ]
         }
         jobsLock.unlock()
-        return ["ok": true, "jobs": list]
+        return ["ok": true, "jobs": list,
+                "note": "Finished jobs stay listed for \(Int(finishedJobRetention / 60)) " +
+                        "minutes so their output can still be collected, then are dropped."]
     }
 
     // ── Shared helpers ──────────────────────────────────────────────────
@@ -650,13 +780,26 @@ enum Shell {
             return ["ok": false, "error": "Failed to launch \(executable): \(error.localizedDescription)"]
         }
 
-        let timedOut: Bool
-        if timeout <= 0 {
-            doneSemaphore.wait()
-            timedOut = false
-        } else {
-            timedOut = doneSemaphore.wait(timeout: .now() + timeout) == .timedOut
-        }
+        // A blocking run is ALWAYS bounded now. `timeout <= 0` used to mean
+        // a bare doneSemaphore.wait() -- wait forever -- and that was a way
+        // to wedge the entire server, not just the one call:
+        //
+        //   Server.swift admits at most 16 concurrent clients
+        //   (`clients = DispatchSemaphore(value: 16)`), and each request
+        //   occupies its slot and a global-queue thread for as long as its
+        //   handler runs. Sixteen never-terminating shell_run calls -- a
+        //   dev server, `tail -f`, anything interactive waiting on input --
+        //   and MacBridge stops answering ANY route, /health included, with
+        //   no way back short of killing it. The Python wrapper actively
+        //   advertised this footgun ("Pass 0 to wait indefinitely") and
+        //   matched it with `timeout=None` client-side, so nothing anywhere
+        //   in the stack would ever give up.
+        //
+        // Anything legitimately longer-running belongs in shell_spawn,
+        // which returns immediately and is polled -- that's the whole
+        // reason it exists.
+        let effectiveTimeout = (timeout <= 0) ? maxExecuteTimeout : min(timeout, maxExecuteTimeout)
+        let timedOut = doneSemaphore.wait(timeout: .now() + effectiveTimeout) == .timedOut
 
         if timedOut {
             process.terminate()
@@ -675,9 +818,14 @@ enum Shell {
         lock.unlock()
 
         if timedOut {
+            let hitCeiling = (timeout <= 0 || timeout > maxExecuteTimeout)
             return [
                 "ok": false,
-                "error": "Command timed out after \(timeout)s and was killed",
+                "error": "Command timed out after \(Int(effectiveTimeout))s and was killed"
+                    + (hitCeiling
+                       ? " (server ceiling for a blocking run -- use shell_spawn for "
+                         + "anything meant to keep running, then poll shell_job_status)"
+                       : ""),
                 "stdout": outStr,
                 "stderr": errStr,
                 "cwd": cwd
