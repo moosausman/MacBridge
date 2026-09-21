@@ -35,12 +35,67 @@ enum AppleScriptModule {
             return ["ok": false, "error": "Script returned no result"]
         }
 
-        // NSAppleEventDescriptor doesn't map cleanly to JSON; surface what
-        // we reasonably can as a string, and the raw description as a
-        // fallback for debugging.
+        // `stringValue` alone is nil for lists and records, so a script like
+        // `get name of every disk` used to come back as `"result": null`
+        // even though it succeeded. Convert the descriptor structurally.
         return [
             "ok": true,
-            "result": result.stringValue ?? NSNull()
+            "result": jsonValue(of: result)
         ]
+    }
+
+    /// Converts an AppleScript result into a JSON-safe value: lists become
+    /// arrays, records become objects, numbers/booleans keep their type,
+    /// and anything else falls back to its text coercion.
+    private static func jsonValue(of descriptor: NSAppleEventDescriptor) -> Any {
+        switch descriptor.descriptorType {
+        case typeNull:
+            return NSNull()
+        case typeAEList:
+            guard descriptor.numberOfItems > 0 else { return [Any]() }
+            return (1...descriptor.numberOfItems).map { index -> Any in
+                descriptor.atIndex(index).map(jsonValue(of:)) ?? NSNull()
+            }
+        case typeAERecord:
+            var object: [String: Any] = [:]
+            if descriptor.numberOfItems > 0 {
+                for index in 1...descriptor.numberOfItems {
+                    let keyword = descriptor.keywordForDescriptor(at: index)
+                    guard let value = descriptor.atIndex(index) else { continue }
+                    if keyword == AEKeyword(0x7573_7266) { // 'usrf' (keyASUserRecordFields)
+                        // User-defined labels arrive as a flat [key, value, ...] list.
+                        let pairs = value.numberOfItems
+                        var i = 1
+                        while i < pairs {
+                            if let key = value.atIndex(i)?.stringValue, let item = value.atIndex(i + 1) {
+                                object[key] = jsonValue(of: item)
+                            }
+                            i += 2
+                        }
+                    } else {
+                        object[fourCharCode(keyword)] = jsonValue(of: value)
+                    }
+                }
+            }
+            return object
+        case typeTrue:
+            return true
+        case typeFalse:
+            return false
+        case typeBoolean:
+            return descriptor.booleanValue
+        case typeSInt16, typeSInt32, typeSInt64, typeUInt32:
+            return Int(descriptor.int32Value)
+        case typeIEEE32BitFloatingPoint, typeIEEE64BitFloatingPoint:
+            return descriptor.doubleValue
+        default:
+            return descriptor.stringValue ?? NSNull()
+        }
+    }
+
+    private static func fourCharCode(_ code: AEKeyword) -> String {
+        let bytes = [24, 16, 8, 0].map { UInt8((code >> $0) & 0xFF) }
+        return String(bytes: bytes, encoding: .macOSRoman)?
+            .trimmingCharacters(in: .whitespaces) ?? String(code)
     }
 }
