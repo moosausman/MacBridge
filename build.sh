@@ -142,6 +142,11 @@ if [ -d "${AGENT_COPY}" ] && [ -w "${AGENT_COPY}" ]; then
     echo "🔁 Updating the Jugnu account's copy at ${AGENT_COPY}..."
     rsync -a --delete "${BUNDLE}/" "${AGENT_COPY}/"
     chmod -R a+rX "${AGENT_COPY}"
+    # The one-time permission setup, opened from inside the Jugnu account.
+    # /Users/Shared itself (not the root-owned Jugnu folder, and not inside
+    # the signed bundle, which would break its signature and its grants).
+    cp "Set Up Jugnu Permissions.command" "/Users/Shared/Set Up Jugnu Permissions.command" \
+        && chmod a+rx "/Users/Shared/Set Up Jugnu Permissions.command"
     if curl -s --max-time 2 "http://localhost:${AGENT_PORT}/health" >/dev/null 2>&1; then
         curl -s --max-time 5 -X POST "http://localhost:${AGENT_PORT}/shell/spawn" \
             -H 'Content-Type: application/json' \

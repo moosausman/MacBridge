@@ -37,6 +37,7 @@ enum PowerRouter {
         case "/documents/pdf-text": return DocumentsModule.text(args: args)
         case "/documents/create-pdf": return DocumentsModule.createPDF(args: args)
         case "/permissions/status": return PermissionStatusModule.status(args: args)
+        case "/permissions/request": return PermissionStatusModule.request(args: args)
         default: return nil
         }
     }

@@ -22,6 +22,11 @@ enum PermissionStatusModule {
 
     private static let settingsPath = "System Settings > Privacy & Security"
 
+    private static let targets = [("Finder", "com.apple.finder"), ("System Events", "com.apple.systemevents"),
+                                  ("Terminal", "com.apple.Terminal"), ("Safari", "com.apple.Safari"),
+                                  ("Mail", "com.apple.mail"), ("Notes", "com.apple.Notes"),
+                                  ("Music", "com.apple.Music"), ("Spotify", "com.spotify.client")]
+
     private static func eventKit(_ type: EKEntityType) -> String {
         let status = EKEventStore.authorizationStatus(for: type)
         switch status {
@@ -106,10 +111,6 @@ enum PermissionStatusModule {
             "full_disk_access": ["status": fullDiskAccess(), "where": "\(settingsPath) > Full Disk Access",
                                  "needed_for": "Safari history and Mail data files (optional)"],
         ]
-        let targets = [("Finder", "com.apple.finder"), ("System Events", "com.apple.systemevents"),
-                       ("Terminal", "com.apple.Terminal"), ("Safari", "com.apple.Safari"),
-                       ("Mail", "com.apple.mail"), ("Notes", "com.apple.Notes"),
-                       ("Music", "com.apple.Music"), ("Spotify", "com.spotify.client")]
         var automationTargets: [String: String] = [:]
         for (name, bundle) in targets { automationTargets[name] = automation(bundle) }
         entries["automation"] = ["status": automationTargets.values.contains("denied") ? "denied" : "granted_or_unknown",
@@ -120,5 +121,90 @@ enum PermissionStatusModule {
             .map { $0.key }.sorted()
         return ["ok": true, "permissions": entries, "missing": missing,
                 "user": NSUserName(), "session_port": listenPort]
+    }
+
+    // MARK: - Asking
+
+    /// Asks macOS for every grant MacBridge uses, in whichever login this
+    /// instance runs, and reports the result.
+    ///
+    ///   /permissions/request  {}
+    ///
+    /// Meant to run while someone is looking at that login's screen. Calendar,
+    /// Reminders, Contacts and each app under Automation have no "+" button in
+    /// System Settings: an app only appears there after it asks, and a request
+    /// made while nobody is watching (the Jugnu account running in the
+    /// background) is never answered. Each prompt gets up to two minutes.
+    /// Accessibility and Screen Recording open System Settings, where the
+    /// switch is turned on by hand.
+    static func request(args: [String: Any]) -> [String: Any] {
+        var asked: [String] = []
+        func waitFor(_ start: (@escaping () -> Void) -> Void) {
+            let done = DispatchSemaphore(value: 0)
+            start { done.signal() }
+            _ = done.wait(timeout: .now() + 120)
+        }
+
+        let store = EKEventStore()
+        if EKEventStore.authorizationStatus(for: .event) == .notDetermined {
+            asked.append("calendar")
+            waitFor { finish in store.requestFullAccessToEvents { _, _ in finish() } }
+        }
+        if EKEventStore.authorizationStatus(for: .reminder) == .notDetermined {
+            asked.append("reminders")
+            waitFor { finish in store.requestFullAccessToReminders { _, _ in finish() } }
+        }
+        if CNContactStore.authorizationStatus(for: .contacts) == .notDetermined {
+            asked.append("contacts")
+            waitFor { finish in CNContactStore().requestAccess(for: .contacts) { _, _ in finish() } }
+        }
+        if notifications() == "not_determined" {
+            asked.append("notifications")
+            waitFor { finish in
+                UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in finish() }
+            }
+        }
+
+        // Automation is asked per app, and macOS only asks about apps that are
+        // running -- so each installed one is started hidden first.
+        for (name, bundleId) in targets {
+            guard let url = PowerSupport.main({ NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId) })
+            else { continue }
+            if automation(bundleId) == "unknown" {
+                let configuration = NSWorkspace.OpenConfiguration()
+                configuration.activates = false
+                configuration.hides = true
+                PowerSupport.main { NSWorkspace.shared.openApplication(at: url, configuration: configuration) }
+                let deadline = Date().addingTimeInterval(10)
+                while automation(bundleId) == "unknown" && Date() < deadline { usleep(300_000) }
+            }
+            guard ["not_determined", "unknown"].contains(automation(bundleId)) else { continue }
+            asked.append("automation:\(name)")
+            waitFor { finish in
+                DispatchQueue.global().async {
+                    let target = NSAppleEventDescriptor(bundleIdentifier: bundleId)
+                    _ = AEDeterminePermissionToAutomateTarget(target.aeDesc, AEEventClass(typeWildCard),
+                                                              AEEventID(typeWildCard), true)
+                    finish()
+                }
+            }
+        }
+
+        if !PowerSupport.main({ AXIsProcessTrusted() }) {
+            asked.append("accessibility")
+            let prompt = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
+            _ = PowerSupport.main { AXIsProcessTrustedWithOptions([prompt: true] as CFDictionary) }
+        }
+        if !CGPreflightScreenCaptureAccess() {
+            asked.append("screen_recording")
+            _ = PowerSupport.main { CGRequestScreenCaptureAccess() }
+        }
+
+        var result = status(args: args)
+        result["asked"] = asked
+        result["note"] = "Screen Recording takes effect after MacBridge restarts. Accessibility and Screen "
+            + "Recording are switched on in System Settings; as a Standard account, macOS asks for an "
+            + "administrator's name and password there."
+        return result
     }
 }

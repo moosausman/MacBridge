@@ -81,6 +81,7 @@ SHARED="/Users/Shared/Jugnu"
 echo "[2/4] Copying MacBridge to $SHARED (readable by both accounts)..."
 sudo mkdir -p "$SHARED"
 sudo rsync -a --delete "$BUNDLE" "$SHARED/"
+cp "$SCRIPT_DIR/Set Up Jugnu Permissions.command" "/Users/Shared/" && chmod a+rx "/Users/Shared/Set Up Jugnu Permissions.command"
 sudo chmod -R a+rX "$SHARED"
 echo "      Done."
 
@@ -150,8 +151,10 @@ PERMISSIONS -- this part cannot be scripted
 TCC grants are per-user AND per-app. The grants you gave MacBridge in your
 own account do not carry over; '$AGENT_USER' has to grant its own.
 
-While logged in AS $AGENT_USER, open System Settings > Privacy & Security
-and add MacBridge to:
+While logged in AS $AGENT_USER, double-click
+    /Users/Shared/Set Up Jugnu Permissions.command
+It asks for everything below while you're watching, and opens System
+Settings for the switches you turn on by hand. What it covers:
 
     Accessibility        keyboard, mouse, the accessibility tree
     Automation           AppleScript to Safari, Mail, Finder, Terminal, Spotify
