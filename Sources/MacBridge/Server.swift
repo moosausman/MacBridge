@@ -107,7 +107,10 @@ final class MacBridgeServer: @unchecked Sendable {
                        body: data.subdata(in: start..<(start + length)))
     }
     private func isUI(_ path: String) -> Bool {
-        ["/mouse/", "/screen/", "/ui/", "/whatsapp/", "/keyboard/", "/clipboard/", "/safari/", "/applescript/", "/automation/", "/spotify/", "/windows/"].contains(where: path.hasPrefix)
+        // Spotify search runs in an off-screen web view; it must not hold the
+        // UI lock (and block every other UI route) while a page loads.
+        if path == "/spotify/search" { return false }
+        return ["/mouse/", "/screen/", "/ui/", "/whatsapp/", "/keyboard/", "/clipboard/", "/safari/", "/applescript/", "/automation/", "/spotify/", "/windows/"].contains(where: path.hasPrefix)
             || path.hasPrefix("/shell/stage")
     }
     private func dispatch(_ path: String, _ args: [String: Any]) -> [String: Any] {

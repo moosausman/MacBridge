@@ -190,6 +190,7 @@ enum Router {
         case "/spotify/state": return SpotifyModule.state(args: args)
         case "/spotify/play-uri": return SpotifyModule.playURI(args: args)
         case "/spotify/control": return SpotifyModule.control(args: args)
+        case "/spotify/search": return SpotifySearchModule.search(args: args)
 
         // Shortcuts (arbitrary shortcut execution — see file header for
         // the localhost-only caveat)

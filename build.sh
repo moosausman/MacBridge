@@ -73,6 +73,7 @@ swiftc -swift-version 5 "${SWIFT_SOURCES[@]}" \
     -framework UserNotifications \
     -framework Vision \
     -framework PDFKit \
+    -framework WebKit \
     -o "${BUNDLE}/Contents/MacOS/${APP_NAME}"
 
 echo "📄 Copying Info.plist..."
