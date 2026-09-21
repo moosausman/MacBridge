@@ -124,3 +124,40 @@ echo
 echo "MacBridge launched."
 echo "Test with: curl http://localhost:8765/health"
 
+
+# ── Keep the Jugnu account's copy in step ─────────────────────────────────
+# setup-agent-session.sh copies the bundle to /Users/Shared/Jugnu for the
+# second login to run. Without this, every later rebuild only updated YOUR
+# instance and the agent session silently kept running the old code.
+# No sudo needed: the bundle directory there is owned by you. The running
+# agent instance is asked to exit and its LaunchAgent (KeepAlive) restarts
+# it from the new binary. Same signing identity, so its permissions carry over.
+AGENT_COPY="/Users/Shared/Jugnu/${BUNDLE}"
+AGENT_PORT="${JUGNU_AGENT_PORT:-8766}"
+if [ -d "${AGENT_COPY}" ] && [ -w "${AGENT_COPY}" ]; then
+    echo
+    echo "🔁 Updating the Jugnu account's copy at ${AGENT_COPY}..."
+    rsync -a --delete "${BUNDLE}/" "${AGENT_COPY}/"
+    chmod -R a+rX "${AGENT_COPY}"
+    if curl -s --max-time 2 "http://localhost:${AGENT_PORT}/health" >/dev/null 2>&1; then
+        curl -s --max-time 5 -X POST "http://localhost:${AGENT_PORT}/shell/spawn" \
+            -H 'Content-Type: application/json' \
+            ${MACBRIDGE_TOKEN:+-H "Authorization: Bearer ${MACBRIDGE_TOKEN}"} \
+            -d '{"args":{"command":"sleep 1; kill $PPID 2>/dev/null; pkill -x MacBridge"}}' >/dev/null || true
+        # Wait for the old instance to go away first, or the check below
+        # just sees it still answering and reports a restart that hasn't happened.
+        for _ in $(seq 1 10); do
+            curl -s --max-time 1 "http://localhost:${AGENT_PORT}/health" >/dev/null 2>&1 || break
+            sleep 0.5
+        done
+        for _ in $(seq 1 30); do
+            sleep 1
+            if curl -s --max-time 2 "http://localhost:${AGENT_PORT}/health" >/dev/null 2>&1; then
+                echo "   Agent session restarted on :${AGENT_PORT} with the new build."
+                break
+            fi
+        done
+    else
+        echo "   Agent session isn't running; it will use the new build next time it starts."
+    fi
+fi

@@ -28,7 +28,7 @@
 
 set -euo pipefail
 
-AGENT_USER="${JUGNU_AGENT_USER:-secondself}"
+AGENT_USER="${JUGNU_AGENT_USER:-jugnu}"
 AGENT_PORT="${JUGNU_AGENT_PORT:-8766}"
 LABEL="ai.jugnu.macbridge.agent"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
