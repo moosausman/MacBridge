@@ -118,6 +118,31 @@ end tell
         }
     }
 
+    /// args: { "maxChars": Int? (default 40000) } — the visible text of the
+    /// frontmost tab (Safari's own `text` property: no JavaScript, so it
+    /// works without "Allow JavaScript from Apple Events").
+    static func pageText(args: [String: Any]) -> [String: Any] {
+        let maxChars = min(max((args["maxChars"] as? Int) ?? 40000, 1000), 200000)
+        let script = """
+        tell application "Safari"
+            if (count of windows) is 0 then return "@@NOWINDOW@@"
+            set d to document of front window
+            return (name of d) & "@@@" & (URL of d) & "@@@" & (text of d)
+        end tell
+        """
+        switch runScript(script) {
+        case .failure(let scriptError):
+            return ["ok": false, "error": scriptError.message]
+        case .success(let value):
+            guard let value, value != "@@NOWINDOW@@" else { return ["ok": false, "error": "No Safari window is open"] }
+            let parts = value.components(separatedBy: "@@@")
+            guard parts.count >= 3 else { return ["ok": false, "error": "Unexpected response from Safari"] }
+            let text = parts[2...].joined(separator: "@@@")
+            return ["ok": true, "title": parts[0], "url": parts[1], "text": String(text.prefix(maxChars)),
+                    "truncated": text.count > maxChars, "characters": text.count]
+        }
+    }
+
     /// args: none — returns the URL and title of the frontmost tab.
     static func currentTab(args: [String: Any]) -> [String: Any] {
         let script = """

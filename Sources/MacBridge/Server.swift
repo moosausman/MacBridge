@@ -107,7 +107,7 @@ final class MacBridgeServer: @unchecked Sendable {
                        body: data.subdata(in: start..<(start + length)))
     }
     private func isUI(_ path: String) -> Bool {
-        ["/mouse/", "/screen/", "/ui/", "/whatsapp/", "/keyboard/", "/clipboard/", "/safari/", "/applescript/", "/automation/", "/spotify/"].contains(where: path.hasPrefix)
+        ["/mouse/", "/screen/", "/ui/", "/whatsapp/", "/keyboard/", "/clipboard/", "/safari/", "/applescript/", "/automation/", "/spotify/", "/windows/"].contains(where: path.hasPrefix)
             || path.hasPrefix("/shell/stage")
     }
     private func dispatch(_ path: String, _ args: [String: Any]) -> [String: Any] {

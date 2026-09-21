@@ -24,6 +24,18 @@ enum PowerRouter {
         case "/whatsapp/open-chat-by-name": return WhatsAppModule.openChatByName(args: args)
         case "/whatsapp/draft": return WhatsAppModule.draft(args: args)
         case "/whatsapp/send": return WhatsAppModule.send(args: args)
+        case "/windows/list": return WindowsModule.list(args: args)
+        case "/windows/focus": return WindowsModule.focus(args: args)
+        case "/windows/set-frame": return WindowsModule.setFrame(args: args)
+        case "/windows/arrange": return WindowsModule.arrange(args: args)
+        case "/windows/minimize": return WindowsModule.minimize(args: args)
+        case "/windows/close": return WindowsModule.close(args: args)
+        case "/ocr/image": return OCRModule.image(args: args)
+        case "/ocr/screen": return OCRModule.screen(args: args)
+        case "/documents/pdf-info": return DocumentsModule.info(args: args)
+        case "/documents/pdf-text": return DocumentsModule.text(args: args)
+        case "/documents/create-pdf": return DocumentsModule.createPDF(args: args)
+        case "/permissions/status": return PermissionStatusModule.status(args: args)
         default: return nil
         }
     }

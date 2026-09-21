@@ -26,6 +26,8 @@ enum Router {
             return Calendar_.create(args: args)
         case "/calendar/delete":
             return Calendar_.delete(args: args)
+        case "/calendar/calendars":
+            return Calendar_.calendars(args: args)
 
         // Reminders
         case "/reminders/list":
@@ -181,6 +183,8 @@ enum Router {
             return Safari.listTabs(args: args)
         case "/safari/current-tab":
             return Safari.currentTab(args: args)
+        case "/safari/page-text":
+            return Safari.pageText(args: args)
 
         // Spotify
         case "/spotify/state": return SpotifyModule.state(args: args)

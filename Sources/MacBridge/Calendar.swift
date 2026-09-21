@@ -76,8 +76,22 @@ enum Calendar_ {
         guard start <= end else {
             return ["ok": false, "error": "'start' must be before 'end'"]
         }
-        guard let calendar = store.defaultCalendarForNewEvents else {
-            return ["ok": false, "error": "No default calendar available — check Calendar permission"]
+        // No default calendar is common: a fresh account, an iCloud calendar
+        // that hasn't synced, or write-only access. Fall back to a named
+        // calendar, then to any writable one, and only then fail -- with the
+        // real reason (the permission state) rather than a guess.
+        let writable = store.calendars(for: .event).filter { $0.allowsContentModifications }
+        let requested = (args["calendar"] as? String)?.lowercased()
+        let chosen = writable.first(where: { requested != nil && $0.title.lowercased() == requested })
+            ?? store.defaultCalendarForNewEvents ?? writable.first
+        guard let calendar = chosen else {
+            let status = EKEventStore.authorizationStatus(for: .event)
+            let granted: Bool
+            if #available(macOS 14.0, *) { granted = status == .fullAccess || status == .writeOnly }
+            else { granted = status == .authorized }
+            return ["ok": false, "error": granted
+                ? "Calendar access is granted but there's no writable calendar. Add one in the Calendar app (File > New Calendar), or sign in to iCloud Calendar."
+                : "Calendar permission is missing — enable MacBridge in System Settings > Privacy & Security > Calendars (Full Access)."]
         }
 
         let event = EKEvent(eventStore: store)
@@ -90,10 +104,18 @@ enum Calendar_ {
 
         do {
             try store.save(event, span: .thisEvent)
-            return ["ok": true, "id": event.eventIdentifier ?? ""]
+            return ["ok": true, "id": event.eventIdentifier ?? "", "calendar": calendar.title]
         } catch {
             return ["ok": false, "error": "Failed to save event: \(error.localizedDescription)"]
         }
+    }
+
+    /// args: none — the calendars MacBridge can see, and which are writable.
+    static func calendars(args: [String: Any]) -> [String: Any] {
+        let cals = store.calendars(for: .event).map {
+            ["title": $0.title, "writable": $0.allowsContentModifications, "source": $0.source?.title ?? ""] as [String: Any]
+        }
+        return ["ok": true, "calendars": cals, "default": store.defaultCalendarForNewEvents?.title ?? NSNull()]
     }
 
     /// args: { "id": String }  — the event's eventIdentifier
