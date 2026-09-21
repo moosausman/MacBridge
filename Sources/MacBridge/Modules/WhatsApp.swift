@@ -188,8 +188,16 @@ enum WhatsAppModule {
     /// openChatByName().
     @discardableResult
     private static func runSearch(query: String, app: NSRunningApplication) throws -> [[String: Any]] {
-        guard let field = element(searchFieldIdentifier, pid: app.processIdentifier),
-              let fieldId = field["elementId"] as? String else {
+        // Right after launch or activation the main window takes a moment to
+        // publish its controls; failing on the first look sent agents off
+        // on long manual detours. Wait for the bar instead.
+        var found = element(searchFieldIdentifier, pid: app.processIdentifier)
+        let deadline = Date().addingTimeInterval(6)
+        while found == nil && Date() < deadline {
+            usleep(300_000)
+            found = element(searchFieldIdentifier, pid: app.processIdentifier)
+        }
+        guard let field = found, let fieldId = field["elementId"] as? String else {
             throw PowerError.message(
                 "Could not find WhatsApp's search bar (\(searchFieldIdentifier)). Make sure the "
                 + "main chat window is open rather than a settings or media view."
@@ -328,6 +336,73 @@ enum WhatsAppModule {
             ]
         }
     }
+    /// The whole "message <name> on WhatsApp" job in one call: launch the app
+    /// if needed, open the chat by name (verifying the header), type the
+    /// text, and press Send -- with every check draft() and send() make
+    /// along the way. Refuses on zero or several matching chats, returning
+    /// the candidates, and never retries an uncertain send.
+    ///
+    /// The Python side gates this behind the user's approval (it sends a
+    /// message), so the agent spends one call where the step-by-step route
+    /// took a dozen or more.
+    static func message(args: [String: Any]) -> [String: Any] {
+        PowerSupport.result {
+            try PowerSupport.trusted()
+            let name = try PowerSupport.text(args, "name", max: 200)
+            let text = try PowerSupport.text(args, "text", max: 16000)
+            guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw PowerError.message("text is empty; nothing to send")
+            }
+            if (try? running()) == nil {
+                let launched = open(args: ["mode": "app"])
+                guard launched["ok"] as? Bool == true else {
+                    throw PowerError.message("Couldn't open WhatsApp: \(launched["error"] as? String ?? "not installed?")")
+                }
+                let deadline = Date().addingTimeInterval(12)
+                while (try? running()) == nil && Date() < deadline { usleep(300_000) }
+            }
+
+            let opened = openChatByName(args: ["name": name])
+            guard opened["ok"] as? Bool == true,
+                  let headerId = opened["headerElementId"] as? String,
+                  let recipient = opened["recipient"] as? String else {
+                var failure = opened
+                failure["sent"] = false
+                return failure
+            }
+            let app = try running()
+            var editorId = opened["editorElementId"] as? String
+            if editorId == nil {
+                usleep(500_000)
+                editorId = element(composerIdentifier, pid: app.processIdentifier)?["elementId"] as? String
+            }
+            guard let editorId else {
+                throw PowerError.message("Opened \(recipient)'s chat but couldn't find the message box. Nothing was sent.")
+            }
+
+            let drafted = draft(args: ["headerElementId": headerId, "editorElementId": editorId,
+                                       "expectedRecipient": recipient, "text": text])
+            guard drafted["ok"] as? Bool == true else {
+                var failure = drafted
+                failure["sent"] = false
+                failure["recipient"] = recipient
+                return failure
+            }
+            guard let button = findSendButton(pid: app.processIdentifier),
+                  let sendId = button["elementId"] as? String else {
+                throw PowerError.message("The message is typed in \(recipient)'s chat, but WhatsApp's Send button "
+                                         + "didn't appear. Nothing was sent.")
+            }
+            let label = normalizedLabel((button["description"] as? String) ?? (button["title"] as? String) ?? "Send")
+            var sent = send(args: ["headerElementId": headerId, "editorElementId": editorId,
+                                   "expectedRecipient": recipient, "sendElementId": sendId,
+                                   "expectedText": text, "expectedSendLabel": label])
+            sent["recipient"] = recipient
+            sent["sent"] = sent["ok"] as? Bool == true
+            return sent
+        }
+    }
+
     /// The caller must choose the conversation header, not a matching sidebar row.
     /// Exact labels alone cannot disambiguate duplicate contact display names.
     private static func context(_ args: [String: Any]) throws -> (NSRunningApplication, AccessibilityModule.Entry, AccessibilityModule.Entry) {
