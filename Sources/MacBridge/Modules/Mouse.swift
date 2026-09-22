@@ -45,8 +45,18 @@ enum MouseModule {
         event.setIntegerValueField(.mouseEventClickState, value: count)
         event.post(tap: .cghidEventTap)
     }
+    /// True when a human is actually sitting at this session's screen.
+    /// In a background session (the Jugnu account, switched out) nobody is,
+    /// and its pointer rests at 0,0 forever -- which the escape gesture
+    /// below would otherwise read as "the user is stopping me", blocking
+    /// every move that session ever makes.
+    private static var atConsole: Bool {
+        guard let info = CGSessionCopyCurrentDictionary() as? [String: Any] else { return true }
+        return info["kCGSSessionOnConsoleKey"] as? Bool ?? true
+    }
     /// Upper-left corner of the main display is a physical escape gesture for animations.
     private static func checkAbort() throws {
+        guard atConsole else { return }
         let p = try location(), bounds = CGDisplayBounds(CGMainDisplayID())
         if abs(p.x - bounds.minX) < 3 && abs(p.y - bounds.minY) < 3 {
             throw PowerError.message("Mouse animation stopped at the main display's upper-left corner; move the mouse away to resume")
