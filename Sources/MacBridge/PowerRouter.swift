@@ -15,6 +15,7 @@ enum PowerRouter {
         case "/ui/activate": return AccessibilityModule.activate(args: args)
         case "/ui/snapshot": return AccessibilityModule.snapshot(args: args)
         case "/ui/find": return AccessibilityModule.find(args: args)
+        case "/ui/selection": return SelectionModule.selection(args: args)
         case "/ui/action": return AccessibilityModule.action(args: args)
         case "/whatsapp/status": return WhatsAppModule.status(args: args)
         case "/whatsapp/open": return WhatsAppModule.open(args: args)
