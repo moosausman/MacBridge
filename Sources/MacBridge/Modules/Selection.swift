@@ -23,11 +23,19 @@ enum SelectionModule {
             var text = ""
             var via = "accessibility"
 
+            // If Accessibility can answer -- even "nothing selected" -- trust
+            // it: that's instant and sends nothing to the app. Only apps that
+            // can't say (Chrome, Electron) get the Cmd-C fallback.
+            var accessibilityAnswered = false
             let axApp = AXUIElementCreateApplication(app.processIdentifier)
             if let focused = AccessibilityModule.elementAttribute(axApp, kAXFocusedUIElementAttribute) {
-                text = AccessibilityModule.string(focused, kAXSelectedTextAttribute) ?? ""
+                var value: CFTypeRef?
+                if AXUIElementCopyAttributeValue(focused, kAXSelectedTextAttribute as CFString, &value) == .success {
+                    accessibilityAnswered = true
+                    text = (value as? String) ?? ""
+                }
             }
-            if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && (args["copyFallback"] as? Bool ?? true) {
+            if !accessibilityAnswered && (args["copyFallback"] as? Bool ?? true) {
                 text = copySelection()
                 via = "copy"
             }
