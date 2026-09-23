@@ -96,7 +96,14 @@ sudo tee "$PLIST" >/dev/null <<EOF
     <key>Label</key><string>$LABEL</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$SHARED/MacBridge.app/Contents/MacOS/MacBridge</string>
+        <!-- /Library/LaunchAgents loads in EVERY user's GUI session, not
+             just the agent's, and there is no per-user key for an agent.
+             Without this guard the main account spent all day spawning a
+             MacBridge that could never work there, failing, and retrying
+             every ten seconds forever. -->
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>[ "\$(id -u)" = "$AGENT_UID" ] || exit 0; exec "$SHARED/MacBridge.app/Contents/MacOS/MacBridge"</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
@@ -105,7 +112,10 @@ sudo tee "$PLIST" >/dev/null <<EOF
         <key>MACBRIDGE_PORT</key><string>$AGENT_PORT</string>
     </dict>
     <key>RunAtLoad</key><true/>
-    <key>KeepAlive</key><true/>
+    <!-- Restart it if it dies, but a clean exit means "not my session";
+         respawning that forever is the loop described above. -->
+    <key>KeepAlive</key>
+    <dict><key>SuccessfulExit</key><false/></dict>
     <key>StandardOutPath</key><string>/tmp/jugnu-macbridge-agent.log</string>
     <key>StandardErrorPath</key><string>/tmp/jugnu-macbridge-agent.err</string>
 </dict>
