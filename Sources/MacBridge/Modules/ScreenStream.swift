@@ -69,8 +69,10 @@ final class ScreenFeed: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked S
     static let shared = ScreenFeed()
 
     /// Stop capturing when no frame has been asked for in this long -- the
-    /// Desk window was closed, or the app quit without saying so.
-    private static let idleTimeout: TimeInterval = 20
+    /// Desk window was closed or hidden, or the app quit without saying so.
+    /// Short, because capture in a background session is the most expensive
+    /// thing Jugnu can leave running by accident.
+    private static let idleTimeout: TimeInterval = 8
 
     private let condition = NSCondition()
     private let queue = DispatchQueue(label: "ai.jugnu.screenfeed")

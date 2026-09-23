@@ -17,6 +17,12 @@ final class MacBridgeServer: @unchecked Sendable {
     func start() {
         let fd = socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { fatalError("socket() failed") }
+        // Close on exec, or every process we spawn -- /shell/run, AppleScript,
+        // the trading terminals -- inherits the listening socket. A long-lived
+        // child then holds the port after MacBridge exits, and the next launch
+        // cannot bind. `caffeinate -d`, started through /shell/run, sat on
+        // :8765 for fifteen hours that way.
+        _ = fcntl(fd, F_SETFD, FD_CLOEXEC)
         var yes: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
         var addr = sockaddr_in()
@@ -27,7 +33,15 @@ final class MacBridgeServer: @unchecked Sendable {
         let bound = withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
         }
-        guard bound == 0, listen(fd, 32) == 0 else { close(fd); fatalError("Cannot bind 127.0.0.1:\(port); is MacBridge already running?") }
+        guard bound == 0, listen(fd, 32) == 0 else {
+            close(fd)
+            // Not a fatalError: crashing here relaunches and crashes again,
+            // and a Swift assertion tells nobody which process is in the way.
+            let why = Self.portInUse(port)
+            FileHandle.standardError.write(Data(why.utf8))
+            NSLog("%@", why)
+            exit(1)
+        }
         socketLock.lock(); listeningSocket = fd; socketLock.unlock()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in self?.acceptLoop(fd) }
     }
@@ -35,6 +49,25 @@ final class MacBridgeServer: @unchecked Sendable {
         socketLock.lock(); let fd = listeningSocket; listeningSocket = -1; socketLock.unlock()
         if fd >= 0 { shutdown(fd, SHUT_RDWR); close(fd) }
     }
+    /// Who has the port, in words the person reading the log can act on.
+    private static func portInUse(_ port: UInt16) -> String {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        task.arguments = ["-nP", "-iTCP:\(port)", "-sTCP:LISTEN", "-Fcp"]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = FileHandle.nullDevice
+        var holder = ""
+        if (try? task.run()) != nil {
+            let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            task.waitUntilExit()
+            let pid = out.split(separator: "\n").first(where: { $0.hasPrefix("p") })?.dropFirst() ?? ""
+            let name = out.split(separator: "\n").first(where: { $0.hasPrefix("c") })?.dropFirst() ?? ""
+            if !pid.isEmpty { holder = " It is held by \(name) (pid \(pid)); `kill \(pid)` frees it." }
+        }
+        return "MacBridge cannot bind 127.0.0.1:\(port).\(holder)\n"
+    }
+
     private func isListening(_ fd: Int32) -> Bool {
         socketLock.lock(); defer { socketLock.unlock() }
         return listeningSocket == fd
@@ -44,6 +77,7 @@ final class MacBridgeServer: @unchecked Sendable {
             let fd = accept(listener, nil, nil)
             if fd < 0 { if errno == EINTR { continue }; break }
             guard clients.wait(timeout: .now()) == .success else { close(fd); continue }
+            _ = fcntl(fd, F_SETFD, FD_CLOEXEC)
             var yes: Int32 = 1
             setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, socklen_t(MemoryLayout<Int32>.size))
             var timeout = timeval(tv_sec: 10, tv_usec: 0)
